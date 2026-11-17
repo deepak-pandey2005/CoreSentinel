@@ -1,0 +1,13 @@
+# CoreSentinel Build Artifacts
+build/
+bin/
+include/coresentinel.skel.h
+bpf/vmlinux.h
+
+# Runtime logs
+coresentinel.log
+*.log
+
+# C objects and archives
+*.o
+*.a
