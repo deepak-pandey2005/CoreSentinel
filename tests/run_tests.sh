@@ -19,6 +19,10 @@ gcc -Wall -Wextra -O2 -I./include -I./bpf src/anomaly.c src/metrics.c tests/test
 gcc -Wall -Wextra -O2 -I./include -I./bpf src/config.c tests/test_config.c -o build/tests/test_config
 ./build/tests/test_config
 
+# Compile and run TUI & Feed tests
+gcc -Wall -Wextra -O2 -I./include -I./bpf -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=600 src/anomaly.c src/tui.c tests/test_tui.c -lpthread -lncursesw -o build/tests/test_tui
+./build/tests/test_tui
+
 echo "=========================================="
 echo "    All CoreSentinel Tests Passed (100%)  "
 echo "=========================================="

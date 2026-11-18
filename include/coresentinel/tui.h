@@ -8,5 +8,6 @@ typedef struct tui_dashboard tui_dashboard_t;
 
 tui_dashboard_t* tui_start(anomaly_state_t *state, int metrics_port);
 void tui_stop(tui_dashboard_t *tui);
+bool tui_is_running(tui_dashboard_t *tui);
 
 #endif /* __CORESENTINEL_TUI_H__ */

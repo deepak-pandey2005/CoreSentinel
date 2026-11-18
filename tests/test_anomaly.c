@@ -11,6 +11,7 @@ void test_anomaly_state_initialization(void) {
     assert(st->exec_count == 0);
     assert(st->conn_count == 0);
     assert(st->alert_count == 0);
+    assert(st->file_count == 0);
     anomaly_state_free(st);
     printf("✓ test_anomaly_state_initialization passed\n");
 }
@@ -69,6 +70,8 @@ void test_anomaly_record_events(void) {
 
     assert(st->total_events == 3);
     assert(st->total_file_opens == 1);
+    assert(st->file_count == 1);
+    assert(strcmp(st->recent_files[0].file_path, "/etc/shadow") == 0);
     assert(st->total_alerts == 2);
     assert(st->alert_count == 2);
     assert(st->alerts_by_sev[SENTINEL_SEV_CRITICAL] == 1);

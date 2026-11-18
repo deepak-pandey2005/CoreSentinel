@@ -2,8 +2,8 @@ CC ?= clang
 BPF_CLANG ?= clang
 BPFTOOL ?= bpftool
 
-CFLAGS ?= -Wall -Wextra -O2 -g -I./include -I./bpf
-LDFLAGS ?= -lbpf -lelf -lz -lpthread
+CFLAGS ?= -Wall -Wextra -O2 -g -I./include -I./bpf -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=600
+LDFLAGS ?= -lbpf -lelf -lz -lpthread -lncursesw
 
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wno-missing-declarations -I/usr/include -I./bpf
 

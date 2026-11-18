@@ -52,6 +52,10 @@ void anomaly_record_event(anomaly_state_t *st, const struct sentinel_event *e) {
         }
         case EVENT_FILE_OPEN: {
             st->total_file_opens++;
+            int slot = st->file_head;
+            st->recent_files[slot] = *e;
+            st->file_head = (slot + 1) % MAX_RECENT_FILES;
+            if (st->file_count < MAX_RECENT_FILES) st->file_count++;
             break;
         }
         case EVENT_PRIV_ESC: {

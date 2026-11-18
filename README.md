@@ -52,9 +52,30 @@ It monitors system activity at kernel execution boundaries with negligible overh
 
 - **True eBPF CO-RE (Compile Once – Run Everywhere)**: Uses BTF (`vmlinux.h`) and `libbpf` for portable execution across modern Linux kernels.
 - **Lockless Event Streaming**: Leverages `BPF_MAP_TYPE_RINGBUF` for memory-efficient, non-blocking telemetry from kernel to userspace.
-- **Zero-Dependency ANSI Terminal Dashboard**: Live terminal UI displaying active executions, network connections, and security alerts.
+- **Interactive Multi-Tab TUI Dashboard (`ncursesw`)**: Real-time terminal interface with multi-tab navigation (`Overview`, `Process Executions`, `Network Sockets`, `Security Alerts`, `File Integrity`), row navigation, interactive event inspection modal, and live feed pause/resume.
 - **Embedded Prometheus Metrics Exporter**: Built-in HTTP microserver on port `:9102` (`/metrics` and `/healthz`) for scraping by Prometheus or Grafana.
 - **Headless Daemon Mode**: `--no-tui` option for running as a headless system service or inside containers.
+
+---
+
+## Interactive TUI Framework & Controls
+
+When launched without `--no-tui`, CoreSentinel presents an interactive ncurses-based dashboard featuring:
+
+1. **Tabbed Navigation**:
+   - `[1: Overview]`: Kernel probe health, lockless ring buffer status, event telemetry, severity breakdown graphs, and live alert ticker.
+   - `[2: Executions]`: Process execution table with binary paths, parent commands, and suspicious directory alerts.
+   - `[3: Sockets]`: TCP outbound socket egress monitoring with destination IP:PORT and backdoor port detection.
+   - `[4: Security Alerts]`: Real-time anomaly alerts with severity highlighting (CRITICAL / HIGH / MEDIUM).
+   - `[5: File Integrity]`: Monitoring of access and write attempts to protected system assets (`/etc/shadow`, `/etc/sudoers`, `/etc/pam.d/*`).
+
+2. **Keybindings**:
+   - `1` - `5` or `Tab` / `Shift-Tab`: Switch between tabs.
+   - `↑` / `↓` or `j` / `k`: Scroll up/down through table entries.
+   - `g` / `G`: Jump to the top or bottom of the list.
+   - `Enter`: Open the **Event Metadata Inspection Modal** showing full un-truncated details of the selected event.
+   - `Space`: Pause or resume the live event stream.
+   - `q` / `Ctrl+C`: Gracefully restore terminal screen and terminate CoreSentinel.
 
 ---
 
@@ -152,6 +173,7 @@ coresentinel_alerts_total{severity="high"} 2
 │   ├── test_anomaly.c          # Unit tests for anomaly engine
 │   ├── test_config.c           # Unit tests for configuration
 │   ├── test_metrics.c          # Unit tests for Prometheus HTTP endpoint
+│   ├── test_tui.c              # Unit tests for TUI and data feeds
 │   └── run_tests.sh            # Automated test runner script
 ├── Makefile                    # Modular build system
 └── README.md                   # Documentation

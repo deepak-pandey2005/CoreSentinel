@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     }
 
     /* Main event poll loop */
-    while (!g_stop) {
+    while (!g_stop && (!tui || tui_is_running(tui))) {
         int res = coresentinel_engine_poll(engine, 100);
         if (res < 0 && res != -EINTR) {
             if (cfg.verbose) {

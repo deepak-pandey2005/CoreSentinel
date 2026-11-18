@@ -6,9 +6,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define MAX_RECENT_EXECS   25
-#define MAX_RECENT_CONNS   25
+#define MAX_RECENT_EXECS   50
+#define MAX_RECENT_CONNS   50
 #define MAX_RECENT_ALERTS  50
+#define MAX_RECENT_FILES   50
 
 typedef struct {
     uint64_t total_events;
@@ -31,6 +32,10 @@ typedef struct {
     struct sentinel_event recent_alerts[MAX_RECENT_ALERTS];
     int alert_head;
     int alert_count;
+
+    struct sentinel_event recent_files[MAX_RECENT_FILES];
+    int file_head;
+    int file_count;
 
     pthread_mutex_t lock;
 } anomaly_state_t;
