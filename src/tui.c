@@ -77,6 +77,11 @@ struct tui_dashboard {
     bool show_modal;
     struct sentinel_event modal_event;
 
+    /* Live Search / Filter state */
+    bool search_mode;
+    char search_query[64];
+    int search_len;
+
     tui_snapshot_t cached_snapshot;
 };
 
@@ -368,17 +373,64 @@ static void truncate_str(char *dest, size_t dest_len, const char *src, int max_w
     }
     int src_len = (int)strlen(src);
     if (src_len <= max_w) {
-        snprintf(dest, dest_len, "%s", src);
+        size_t copy_len = (size_t)src_len < dest_len - 1 ? (size_t)src_len : dest_len - 1;
+        memcpy(dest, src, copy_len);
+        dest[copy_len] = '\0';
     } else {
         if (max_w <= 3) {
-            snprintf(dest, dest_len, "%.*s", max_w, "...");
+            size_t copy_len = (size_t)max_w < dest_len - 1 ? (size_t)max_w : dest_len - 1;
+            memset(dest, '.', copy_len);
+            dest[copy_len] = '\0';
         } else {
-            snprintf(dest, dest_len, "%.*s...", max_w - 3, src);
+            size_t prefix_len = (size_t)(max_w - 3);
+            if (prefix_len >= dest_len - 4) {
+                prefix_len = dest_len > 4 ? dest_len - 4 : 0;
+            }
+            memcpy(dest, src, prefix_len);
+            memcpy(dest + prefix_len, "...", 3);
+            dest[prefix_len + 3] = '\0';
         }
     }
 }
 
+static bool event_matches_filter(const struct sentinel_event *e, const char *query) {
+    if (!query || query[0] == '\0') return true;
+
+    char q_lower[64];
+    size_t q_len = strlen(query);
+    if (q_len >= sizeof(q_lower)) q_len = sizeof(q_lower) - 1;
+    for (size_t i = 0; i < q_len; i++) {
+        char c = query[i];
+        q_lower[i] = (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+    }
+    q_lower[q_len] = '\0';
+
+    char target[512];
+    char ip_str[32] = {0};
+    if (e->daddr) {
+        format_ip_addr(e->daddr, ip_str, sizeof(ip_str));
+    }
+    snprintf(target, sizeof(target), "%u %u %s %s %s %s %s %s",
+             e->pid, e->uid, e->comm, e->pcomm,
+             e->filename, e->file_path, e->alert_msg, ip_str);
+
+    for (size_t i = 0; target[i]; i++) {
+        char c = target[i];
+        target[i] = (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+    }
+
+    return (strstr(target, q_lower) != NULL);
+}
+
 static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int filtered_indices[MAX_RECENT_EXECS];
+    int filtered_count = 0;
+    for (int i = 0; i < snap->num_execs; i++) {
+        if (event_matches_filter(&snap->execs[i], tui->search_query)) {
+            filtered_indices[filtered_count++] = i;
+        }
+    }
+
     int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 14 + 1 + 14; /* 59 cols for PID, UID, COMM, PARENT, STATUS */
     int path_w = max_x - fixed_w - 6;
     if (path_w < 15) path_w = 15;
@@ -392,15 +444,15 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
     int rows = max_y - start_y - 3;
     if (rows <= 0) return;
 
-    if (snap->num_execs == 0) {
+    if (filtered_count == 0) {
         attron(COLOR_PAIR(PAIR_DIM_GRAY));
-        mvprintw(start_y + 3, 4, "(Waiting for process execution events...)");
+        mvprintw(start_y + 3, 4, tui->search_query[0] ? "(No executions match search filter)" : "(Waiting for process execution events...)");
         attroff(COLOR_PAIR(PAIR_DIM_GRAY));
         return;
     }
 
     int current_sel = tui->selected_row[TAB_EXECS];
-    if (current_sel >= snap->num_execs) current_sel = snap->num_execs - 1;
+    if (current_sel >= filtered_count) current_sel = filtered_count - 1;
     if (current_sel < 0) current_sel = 0;
     tui->selected_row[TAB_EXECS] = current_sel;
 
@@ -410,12 +462,12 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
     tui->scroll_offset[TAB_EXECS] = offset;
 
     char path_buf[256];
-    for (int i = 0; i < rows && (offset + i) < snap->num_execs; i++) {
-        int idx = offset + i;
+    for (int i = 0; i < rows && (offset + i) < filtered_count; i++) {
+        int idx = filtered_indices[offset + i];
         const struct sentinel_event *e = &snap->execs[idx];
         int y = start_y + 2 + i;
 
-        bool is_selected = (idx == current_sel);
+        bool is_selected = ((offset + i) == current_sel);
         if (is_selected) {
             attron(COLOR_PAIR(PAIR_SELECTED_ROW) | A_BOLD);
             mvhline(y, 1, ' ', max_x - 2);
@@ -449,6 +501,14 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
 }
 
 static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int filtered_indices[MAX_RECENT_CONNS];
+    int filtered_count = 0;
+    for (int i = 0; i < snap->num_conns; i++) {
+        if (event_matches_filter(&snap->conns[i], tui->search_query)) {
+            filtered_indices[filtered_count++] = i;
+        }
+    }
+
     int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 8 + 1 + 14; /* 53 cols */
     int ep_w = max_x - fixed_w - 6;
     if (ep_w < 18) ep_w = 18;
@@ -462,15 +522,15 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
     int rows = max_y - start_y - 3;
     if (rows <= 0) return;
 
-    if (snap->num_conns == 0) {
+    if (filtered_count == 0) {
         attron(COLOR_PAIR(PAIR_DIM_GRAY));
-        mvprintw(start_y + 3, 4, "(Waiting for socket connection events...)");
+        mvprintw(start_y + 3, 4, tui->search_query[0] ? "(No socket connections match search filter)" : "(Waiting for socket connection events...)");
         attroff(COLOR_PAIR(PAIR_DIM_GRAY));
         return;
     }
 
     int current_sel = tui->selected_row[TAB_SOCKETS];
-    if (current_sel >= snap->num_conns) current_sel = snap->num_conns - 1;
+    if (current_sel >= filtered_count) current_sel = filtered_count - 1;
     if (current_sel < 0) current_sel = 0;
     tui->selected_row[TAB_SOCKETS] = current_sel;
 
@@ -483,12 +543,12 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
     char raw_ep[64];
     char ep_str[64];
 
-    for (int i = 0; i < rows && (offset + i) < snap->num_conns; i++) {
-        int idx = offset + i;
+    for (int i = 0; i < rows && (offset + i) < filtered_count; i++) {
+        int idx = filtered_indices[offset + i];
         const struct sentinel_event *e = &snap->conns[idx];
         int y = start_y + 2 + i;
 
-        bool is_selected = (idx == current_sel);
+        bool is_selected = ((offset + i) == current_sel);
         if (is_selected) {
             attron(COLOR_PAIR(PAIR_SELECTED_ROW) | A_BOLD);
             mvhline(y, 1, ' ', max_x - 2);
@@ -524,6 +584,14 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
 }
 
 static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int filtered_indices[MAX_RECENT_ALERTS];
+    int filtered_count = 0;
+    for (int i = 0; i < snap->num_alerts; i++) {
+        if (event_matches_filter(&snap->alerts[i], tui->search_query)) {
+            filtered_indices[filtered_count++] = i;
+        }
+    }
+
     int fixed_w = 12 + 1 + 7 + 1 + 14 + 1; /* 36 cols */
     int detail_w = max_x - fixed_w - 6;
     if (detail_w < 20) detail_w = 20;
@@ -537,15 +605,15 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
     int rows = max_y - start_y - 3;
     if (rows <= 0) return;
 
-    if (snap->num_alerts == 0) {
+    if (filtered_count == 0) {
         attron(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
-        mvprintw(start_y + 3, 4, "✔ No security anomalies detected. System operating within baseline.");
+        mvprintw(start_y + 3, 4, tui->search_query[0] ? "✔ No security anomalies match search filter." : "✔ No security anomalies detected. System operating within baseline.");
         attroff(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
         return;
     }
 
     int current_sel = tui->selected_row[TAB_ALERTS];
-    if (current_sel >= snap->num_alerts) current_sel = snap->num_alerts - 1;
+    if (current_sel >= filtered_count) current_sel = filtered_count - 1;
     if (current_sel < 0) current_sel = 0;
     tui->selected_row[TAB_ALERTS] = current_sel;
 
@@ -555,12 +623,12 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
     tui->scroll_offset[TAB_ALERTS] = offset;
 
     char alert_buf[256];
-    for (int i = 0; i < rows && (offset + i) < snap->num_alerts; i++) {
-        int idx = offset + i;
+    for (int i = 0; i < rows && (offset + i) < filtered_count; i++) {
+        int idx = filtered_indices[offset + i];
         const struct sentinel_event *e = &snap->alerts[idx];
         int y = start_y + 2 + i;
 
-        bool is_selected = (idx == current_sel);
+        bool is_selected = ((offset + i) == current_sel);
         if (is_selected) {
             attron(COLOR_PAIR(PAIR_SELECTED_ROW) | A_BOLD);
             mvhline(y, 1, ' ', max_x - 2);
@@ -603,6 +671,14 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
 }
 
 static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int filtered_indices[MAX_RECENT_FILES];
+    int filtered_count = 0;
+    for (int i = 0; i < snap->num_files; i++) {
+        if (event_matches_filter(&snap->files[i], tui->search_query)) {
+            filtered_indices[filtered_count++] = i;
+        }
+    }
+
     int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 8 + 1 + 15 + 1; /* 55 cols */
     int path_w = max_x - fixed_w - 6;
     if (path_w < 15) path_w = 15;
@@ -616,15 +692,15 @@ static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max
     int rows = max_y - start_y - 3;
     if (rows <= 0) return;
 
-    if (snap->num_files == 0) {
+    if (filtered_count == 0) {
         attron(COLOR_PAIR(PAIR_DIM_GRAY));
-        mvprintw(start_y + 3, 4, "(Waiting for file open events...)");
+        mvprintw(start_y + 3, 4, tui->search_query[0] ? "(No file events match search filter)" : "(Waiting for file open events...)");
         attroff(COLOR_PAIR(PAIR_DIM_GRAY));
         return;
     }
 
     int current_sel = tui->selected_row[TAB_FILES];
-    if (current_sel >= snap->num_files) current_sel = snap->num_files - 1;
+    if (current_sel >= filtered_count) current_sel = filtered_count - 1;
     if (current_sel < 0) current_sel = 0;
     tui->selected_row[TAB_FILES] = current_sel;
 
@@ -634,12 +710,12 @@ static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max
     tui->scroll_offset[TAB_FILES] = offset;
 
     char path_buf[256];
-    for (int i = 0; i < rows && (offset + i) < snap->num_files; i++) {
-        int idx = offset + i;
+    for (int i = 0; i < rows && (offset + i) < filtered_count; i++) {
+        int idx = filtered_indices[offset + i];
         const struct sentinel_event *e = &snap->files[idx];
         int y = start_y + 2 + i;
 
-        bool is_selected = (idx == current_sel);
+        bool is_selected = ((offset + i) == current_sel);
         if (is_selected) {
             attron(COLOR_PAIR(PAIR_SELECTED_ROW) | A_BOLD);
             mvhline(y, 1, ' ', max_x - 2);
@@ -748,6 +824,24 @@ static void draw_modal_dialog(tui_dashboard_t *tui, int max_y, int max_x) {
 static void draw_footer(tui_dashboard_t *tui, int max_y, int max_x) {
     mvhline(max_y - 2, 0, ACS_HLINE, max_x);
 
+    if (tui->search_mode) {
+        move(max_y - 1, 1);
+        attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
+        printw("Search: /");
+        attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
+        attron(COLOR_PAIR(PAIR_DEFAULT) | A_BOLD);
+        printw("%s", tui->search_query);
+        attroff(COLOR_PAIR(PAIR_DEFAULT) | A_BOLD);
+        attron(COLOR_PAIR(PAIR_STATUS_WARN) | A_BLINK);
+        printw("_");
+        attroff(COLOR_PAIR(PAIR_STATUS_WARN) | A_BLINK);
+
+        attron(COLOR_PAIR(PAIR_DIM_GRAY));
+        printw("  (Press [Enter] to apply, [Esc] to cancel)");
+        attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+        return;
+    }
+
     move(max_y - 1, 1);
     attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
     printw("Keys: ");
@@ -756,25 +850,35 @@ static void draw_footer(tui_dashboard_t *tui, int max_y, int max_x) {
     attron(COLOR_PAIR(PAIR_DEFAULT));
     printw("[1-5/Tab]");
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
-    printw(" Switch Tab  ");
+    printw(" Tab ");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     attron(COLOR_PAIR(PAIR_DEFAULT));
-    printw("[↑/↓/j/k]");
+    printw("[↑↓/jk/PgUp/Dn]");
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
-    printw(" Select  ");
+    printw(" Nav ");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+
+    attron(COLOR_PAIR(PAIR_DEFAULT));
+    printw("[/]");
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    if (tui->search_query[0]) {
+        printw(" Filter:\"%s\" ", tui->search_query);
+    } else {
+        printw(" Filter ");
+    }
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     attron(COLOR_PAIR(PAIR_DEFAULT));
     printw("[Enter]");
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
-    printw(" Inspect  ");
+    printw(" Inspect ");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     attron(COLOR_PAIR(PAIR_DEFAULT));
     printw("[Space]");
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
-    printw(" Pause/Resume  ");
+    printw(" Pause ");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     attron(COLOR_PAIR(PAIR_DEFAULT));
@@ -784,8 +888,8 @@ static void draw_footer(tui_dashboard_t *tui, int max_y, int max_x) {
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     if (tui->is_paused) {
-        int warn_x = max_x - 30;
-        if (warn_x > 50) {
+        int warn_x = max_x - 24;
+        if (warn_x > 60) {
             attron(COLOR_PAIR(PAIR_STATUS_WARN) | A_BOLD);
             mvprintw(max_y - 1, warn_x, "[ LIVE FEED PAUSED ]");
             attroff(COLOR_PAIR(PAIR_STATUS_WARN) | A_BOLD);
@@ -885,7 +989,43 @@ static void* tui_render_loop(void *arg) {
             continue;
         }
 
+        if (tui->search_mode) {
+            if (ch == 27) { /* Esc: cancel */
+                tui->search_mode = false;
+            } else if (ch == '\n' || ch == '\r') { /* Enter: confirm filter */
+                tui->search_mode = false;
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+                if (tui->search_len > 0) {
+                    tui->search_len--;
+                    tui->search_query[tui->search_len] = '\0';
+                    tui->selected_row[tui->active_tab] = 0;
+                    tui->scroll_offset[tui->active_tab] = 0;
+                }
+            } else if (ch >= 32 && ch <= 126) {
+                if (tui->search_len < (int)sizeof(tui->search_query) - 1) {
+                    tui->search_query[tui->search_len++] = (char)ch;
+                    tui->search_query[tui->search_len] = '\0';
+                    tui->selected_row[tui->active_tab] = 0;
+                    tui->scroll_offset[tui->active_tab] = 0;
+                }
+            }
+            continue;
+        }
+
         switch (ch) {
+            case '/':
+                tui->search_mode = true;
+                break;
+
+            case 'c':
+            case 'C':
+                /* Clear active filter */
+                tui->search_query[0] = '\0';
+                tui->search_len = 0;
+                tui->selected_row[tui->active_tab] = 0;
+                tui->scroll_offset[tui->active_tab] = 0;
+                break;
+
             case 'q':
             case 'Q':
                 tui->running = false;
@@ -925,10 +1065,26 @@ static void* tui_render_loop(void *arg) {
                 }
                 break;
 
+            case KEY_NPAGE: /* Page Down */
+            case 4:         /* Ctrl+d */
+                tui->selected_row[tui->active_tab] += 10;
+                break;
+
+            case KEY_PPAGE: /* Page Up */
+            case 21:        /* Ctrl+u */
+                if (tui->selected_row[tui->active_tab] > 10) {
+                    tui->selected_row[tui->active_tab] -= 10;
+                } else {
+                    tui->selected_row[tui->active_tab] = 0;
+                }
+                break;
+
+            case KEY_HOME:
             case 'g':
                 tui->selected_row[tui->active_tab] = 0;
                 break;
 
+            case KEY_END:
             case 'G':
                 tui->selected_row[tui->active_tab] = 9999;
                 break;
@@ -937,22 +1093,60 @@ static void* tui_render_loop(void *arg) {
             case '\r': {
                 int tab = tui->active_tab;
                 int row = tui->selected_row[tab];
+
+                /* Map filtered index back to underlying snapshot event */
                 if (tab == TAB_EXECS && snap.num_execs > 0) {
-                    if (row >= snap.num_execs) row = snap.num_execs - 1;
-                    tui->modal_event = snap.execs[row];
-                    tui->show_modal = true;
+                    int filtered_indices[MAX_RECENT_EXECS];
+                    int filtered_count = 0;
+                    for (int i = 0; i < snap.num_execs; i++) {
+                        if (event_matches_filter(&snap.execs[i], tui->search_query)) {
+                            filtered_indices[filtered_count++] = i;
+                        }
+                    }
+                    if (filtered_count > 0) {
+                        if (row >= filtered_count) row = filtered_count - 1;
+                        tui->modal_event = snap.execs[filtered_indices[row]];
+                        tui->show_modal = true;
+                    }
                 } else if (tab == TAB_SOCKETS && snap.num_conns > 0) {
-                    if (row >= snap.num_conns) row = snap.num_conns - 1;
-                    tui->modal_event = snap.conns[row];
-                    tui->show_modal = true;
+                    int filtered_indices[MAX_RECENT_CONNS];
+                    int filtered_count = 0;
+                    for (int i = 0; i < snap.num_conns; i++) {
+                        if (event_matches_filter(&snap.conns[i], tui->search_query)) {
+                            filtered_indices[filtered_count++] = i;
+                        }
+                    }
+                    if (filtered_count > 0) {
+                        if (row >= filtered_count) row = filtered_count - 1;
+                        tui->modal_event = snap.conns[filtered_indices[row]];
+                        tui->show_modal = true;
+                    }
                 } else if (tab == TAB_ALERTS && snap.num_alerts > 0) {
-                    if (row >= snap.num_alerts) row = snap.num_alerts - 1;
-                    tui->modal_event = snap.alerts[row];
-                    tui->show_modal = true;
+                    int filtered_indices[MAX_RECENT_ALERTS];
+                    int filtered_count = 0;
+                    for (int i = 0; i < snap.num_alerts; i++) {
+                        if (event_matches_filter(&snap.alerts[i], tui->search_query)) {
+                            filtered_indices[filtered_count++] = i;
+                        }
+                    }
+                    if (filtered_count > 0) {
+                        if (row >= filtered_count) row = filtered_count - 1;
+                        tui->modal_event = snap.alerts[filtered_indices[row]];
+                        tui->show_modal = true;
+                    }
                 } else if (tab == TAB_FILES && snap.num_files > 0) {
-                    if (row >= snap.num_files) row = snap.num_files - 1;
-                    tui->modal_event = snap.files[row];
-                    tui->show_modal = true;
+                    int filtered_indices[MAX_RECENT_FILES];
+                    int filtered_count = 0;
+                    for (int i = 0; i < snap.num_files; i++) {
+                        if (event_matches_filter(&snap.files[i], tui->search_query)) {
+                            filtered_indices[filtered_count++] = i;
+                        }
+                    }
+                    if (filtered_count > 0) {
+                        if (row >= filtered_count) row = filtered_count - 1;
+                        tui->modal_event = snap.files[filtered_indices[row]];
+                        tui->show_modal = true;
+                    }
                 }
                 break;
             }
