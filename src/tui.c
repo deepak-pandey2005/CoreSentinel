@@ -3,6 +3,7 @@
 #include <curses.h>
 #include <locale.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,7 +70,7 @@ struct tui_dashboard {
     anomaly_state_t *state;
     int metrics_port;
     pthread_t thread;
-    volatile bool running;
+    atomic_bool running;
     time_t start_time;
 
     int active_tab;
@@ -458,12 +459,12 @@ static bool event_matches_filter(const struct sentinel_event *e, const char *que
     }
     q_lower[q_len] = '\0';
 
-    char target[512];
+    char target[1024];
     char ip_str[32] = {0};
     if (e->daddr) {
         format_ip_addr(e->daddr, ip_str, sizeof(ip_str));
     }
-    snprintf(target, sizeof(target), "%u %u %s %s %s %s %s %s",
+    snprintf(target, sizeof(target), "%u %u %.63s %.63s %.127s %.127s %.255s %s",
              e->pid, e->uid, e->comm, e->pcomm,
              e->filename, e->file_path, e->alert_msg, ip_str);
 
@@ -1046,7 +1047,8 @@ static void* tui_render_loop(void *arg) {
             draw_modal_dialog(tui, max_y, max_x);
         }
 
-        refresh();
+        wnoutrefresh(stdscr);
+        doupdate();
 
         int ch = getch();
         if (ch == ERR) {
