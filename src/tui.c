@@ -63,6 +63,8 @@ typedef struct {
     struct sentinel_event files[MAX_RECENT_FILES];
 } tui_snapshot_t;
 
+#define SPARKLINE_LEN 16
+
 struct tui_dashboard {
     anomaly_state_t *state;
     int metrics_port;
@@ -81,6 +83,15 @@ struct tui_dashboard {
     bool search_mode;
     char search_query[64];
     int search_len;
+
+    /* Event Rate & Sparkline tracking */
+    time_t last_rate_calc;
+    uint64_t last_total_events;
+    uint64_t last_total_alerts;
+    double current_eps;
+    double current_aps;
+    uint32_t eps_history[SPARKLINE_LEN];
+    int eps_history_idx;
 
     tui_snapshot_t cached_snapshot;
 };
@@ -198,6 +209,13 @@ static void draw_header(tui_dashboard_t *tui, int max_x, const tui_snapshot_t *s
     attroff(COLOR_PAIR(PAIR_METRIC_ACCENT) | A_BOLD);
 
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    printw(" | Rate: ");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+    attron(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
+    printw("%.1f eps", tui->current_eps);
+    attroff(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
     printw(" | Metrics: ");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
     attron(COLOR_PAIR(PAIR_HEADER));
@@ -252,7 +270,7 @@ static void draw_tabs(tui_dashboard_t *tui, int max_x) {
     mvhline(4, 0, ACS_HLINE, max_x);
 }
 
-static void draw_overview_tab(int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+static void draw_overview_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
     int available_rows = max_y - start_y - 2;
     if (available_rows < 6) return;
 
@@ -293,6 +311,41 @@ static void draw_overview_tab(int start_y, int max_y, int max_x, const tui_snaps
     attron(COLOR_PAIR(PAIR_METRIC_ACCENT));
     printw("Lockless RingBuffer 256KB");
     attroff(COLOR_PAIR(PAIR_METRIC_ACCENT));
+
+    mvprintw(start_y + 7, 3, "Event Ingestion    : ");
+    attron(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
+    printw("%.1f eps", tui->current_eps);
+    attroff(COLOR_PAIR(PAIR_STATUS_OK) | A_BOLD);
+    printw(" (Alerts: ");
+    if (tui->current_aps > 0) {
+        attron(COLOR_PAIR(PAIR_STATUS_ALERT) | A_BOLD);
+        printw("%.1f aps", tui->current_aps);
+        attroff(COLOR_PAIR(PAIR_STATUS_ALERT) | A_BOLD);
+    } else {
+        attron(COLOR_PAIR(PAIR_STATUS_OK));
+        printw("0.0 aps");
+        attroff(COLOR_PAIR(PAIR_STATUS_OK));
+    }
+    printw(")");
+
+    // Activity Sparkline
+    mvprintw(start_y + 8, 3, "Traffic Sparkline  : [");
+    static const char *sparks[] = {" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    uint32_t max_val = 1;
+    for (int i = 0; i < SPARKLINE_LEN; i++) {
+        if (tui->eps_history[i] > max_val) max_val = tui->eps_history[i];
+    }
+    attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
+    for (int i = 0; i < SPARKLINE_LEN; i++) {
+        int idx = (tui->eps_history_idx + i) % SPARKLINE_LEN;
+        uint32_t val = tui->eps_history[idx];
+        int s_idx = (val * 7) / max_val;
+        if (s_idx < 0) s_idx = 0;
+        if (s_idx > 7) s_idx = 7;
+        printw("%s", sparks[s_idx]);
+    }
+    attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
+    printw("]");
 
     // Right Column: Telemetry & Threat Metrics
     int right_col = left_w + 5;
@@ -917,6 +970,30 @@ static void* tui_render_loop(void *arg) {
         if (!tui->is_paused) {
             copy_snapshot(tui->state, &snap);
             tui->cached_snapshot = snap;
+
+            /* Compute events/sec and alerts/sec periodically */
+            time_t now = time(NULL);
+            if (tui->last_rate_calc == 0) {
+                tui->last_rate_calc = now;
+                tui->last_total_events = snap.total_events;
+                tui->last_total_alerts = snap.total_alerts;
+            } else if (now > tui->last_rate_calc) {
+                double dt = (double)(now - tui->last_rate_calc);
+                uint64_t d_events = (snap.total_events >= tui->last_total_events) ?
+                                    (snap.total_events - tui->last_total_events) : 0;
+                uint64_t d_alerts = (snap.total_alerts >= tui->last_total_alerts) ?
+                                    (snap.total_alerts - tui->last_total_alerts) : 0;
+
+                tui->current_eps = (double)d_events / dt;
+                tui->current_aps = (double)d_alerts / dt;
+
+                tui->eps_history[tui->eps_history_idx] = (uint32_t)d_events;
+                tui->eps_history_idx = (tui->eps_history_idx + 1) % SPARKLINE_LEN;
+
+                tui->last_rate_calc = now;
+                tui->last_total_events = snap.total_events;
+                tui->last_total_alerts = snap.total_alerts;
+            }
         } else {
             snap = tui->cached_snapshot;
         }
@@ -945,7 +1022,7 @@ static void* tui_render_loop(void *arg) {
         int content_y = 5;
         switch (tui->active_tab) {
             case TAB_OVERVIEW:
-                draw_overview_tab(content_y, max_y, max_x, &snap);
+                draw_overview_tab(tui, content_y, max_y, max_x, &snap);
                 break;
             case TAB_EXECS:
                 draw_executions_tab(tui, content_y, max_y, max_x, &snap);
