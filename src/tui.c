@@ -361,10 +361,31 @@ static void draw_overview_tab(int start_y, int max_y, int max_x, const tui_snaps
     }
 }
 
+static void truncate_str(char *dest, size_t dest_len, const char *src, int max_w) {
+    if (!src || max_w <= 0 || dest_len == 0) {
+        if (dest_len > 0) dest[0] = '\0';
+        return;
+    }
+    int src_len = (int)strlen(src);
+    if (src_len <= max_w) {
+        snprintf(dest, dest_len, "%s", src);
+    } else {
+        if (max_w <= 3) {
+            snprintf(dest, dest_len, "%.*s", max_w, "...");
+        } else {
+            snprintf(dest, dest_len, "%.*s...", max_w - 3, src);
+        }
+    }
+}
+
 static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 14 + 1 + 14; /* 59 cols for PID, UID, COMM, PARENT, STATUS */
+    int path_w = max_x - fixed_w - 6;
+    if (path_w < 15) path_w = 15;
+
     attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
-    mvprintw(start_y, 2, "%-7s %-6s %-14s %-14s %-38s %-12s",
-             "PID", "UID", "COMM", "PARENT", "BINARY PATH", "STATUS");
+    mvprintw(start_y, 2, "%-7s %-6s %-14s %-14s %-*s %-12s",
+             "PID", "UID", "COMM", "PARENT", path_w, "BINARY PATH", "STATUS");
     attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
     mvhline(start_y + 1, 2, ACS_HLINE, max_x - 4);
 
@@ -388,6 +409,7 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
     if (current_sel >= offset + rows) offset = current_sel - rows + 1;
     tui->scroll_offset[TAB_EXECS] = offset;
 
+    char path_buf[256];
     for (int i = 0; i < rows && (offset + i) < snap->num_execs; i++) {
         int idx = offset + i;
         const struct sentinel_event *e = &snap->execs[idx];
@@ -399,14 +421,14 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
             mvhline(y, 1, ' ', max_x - 2);
         }
 
-        char path_buf[40];
-        snprintf(path_buf, sizeof(path_buf), "%s", e->filename);
+        truncate_str(path_buf, sizeof(path_buf), e->filename, path_w);
 
-        mvprintw(y, 2, "%-7u %-6u %-14s %-14s %-38s ",
+        mvprintw(y, 2, "%-7u %-6u %-14s %-14s %-*s ",
                  e->pid,
                  e->uid,
                  e->comm,
                  e->pcomm[0] ? e->pcomm : "-",
+                 path_w,
                  path_buf);
 
         if (!is_selected) {
@@ -427,9 +449,13 @@ static void draw_executions_tab(tui_dashboard_t *tui, int start_y, int max_y, in
 }
 
 static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 8 + 1 + 14; /* 53 cols */
+    int ep_w = max_x - fixed_w - 6;
+    if (ep_w < 18) ep_w = 18;
+
     attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
-    mvprintw(start_y, 2, "%-7s %-6s %-14s %-28s %-8s %-12s",
-             "PID", "UID", "COMM", "REMOTE ENDPOINT", "PROTO", "STATUS");
+    mvprintw(start_y, 2, "%-7s %-6s %-14s %-*s %-8s %-12s",
+             "PID", "UID", "COMM", ep_w, "REMOTE ENDPOINT", "PROTO", "STATUS");
     attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
     mvhline(start_y + 1, 2, ACS_HLINE, max_x - 4);
 
@@ -453,6 +479,10 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
     if (current_sel >= offset + rows) offset = current_sel - rows + 1;
     tui->scroll_offset[TAB_SOCKETS] = offset;
 
+    char ip_str[32];
+    char raw_ep[64];
+    char ep_str[64];
+
     for (int i = 0; i < rows && (offset + i) < snap->num_conns; i++) {
         int idx = offset + i;
         const struct sentinel_event *e = &snap->conns[idx];
@@ -464,15 +494,15 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
             mvhline(y, 1, ' ', max_x - 2);
         }
 
-        char ip_str[32];
-        char ep_str[40];
         format_ip_addr(e->daddr, ip_str, sizeof(ip_str));
-        snprintf(ep_str, sizeof(ep_str), "%s:%u", ip_str, e->dport);
+        snprintf(raw_ep, sizeof(raw_ep), "%s:%u", ip_str, e->dport);
+        truncate_str(ep_str, sizeof(ep_str), raw_ep, ep_w);
 
-        mvprintw(y, 2, "%-7u %-6u %-14s %-28s %-8s ",
+        mvprintw(y, 2, "%-7u %-6u %-14s %-*s %-8s ",
                  e->pid,
                  e->uid,
                  e->comm,
+                 ep_w,
                  ep_str,
                  "TCP");
 
@@ -494,9 +524,13 @@ static void draw_sockets_tab(tui_dashboard_t *tui, int start_y, int max_y, int m
 }
 
 static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int fixed_w = 12 + 1 + 7 + 1 + 14 + 1; /* 36 cols */
+    int detail_w = max_x - fixed_w - 6;
+    if (detail_w < 20) detail_w = 20;
+
     attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
-    mvprintw(start_y, 2, "%-12s %-7s %-14s %-48s",
-             "SEVERITY", "PID", "COMM", "ALERT DETAILS");
+    mvprintw(start_y, 2, "%-12s %-7s %-14s %-*s",
+             "SEVERITY", "PID", "COMM", detail_w, "ALERT DETAILS");
     attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
     mvhline(start_y + 1, 2, ACS_HLINE, max_x - 4);
 
@@ -520,6 +554,7 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
     if (current_sel >= offset + rows) offset = current_sel - rows + 1;
     tui->scroll_offset[TAB_ALERTS] = offset;
 
+    char alert_buf[256];
     for (int i = 0; i < rows && (offset + i) < snap->num_alerts; i++) {
         int idx = offset + i;
         const struct sentinel_event *e = &snap->alerts[idx];
@@ -553,12 +588,12 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
             printw("[%-8s]", sev_str);
         }
 
-        char alert_buf[60];
-        snprintf(alert_buf, sizeof(alert_buf), "%s", e->alert_msg);
+        truncate_str(alert_buf, sizeof(alert_buf), e->alert_msg, detail_w);
 
-        printw(" %-7u %-14s %s",
+        printw(" %-7u %-14s %-*s",
                e->pid,
                e->comm,
+               detail_w,
                alert_buf);
 
         if (is_selected) {
@@ -568,9 +603,13 @@ static void draw_alerts_tab(tui_dashboard_t *tui, int start_y, int max_y, int ma
 }
 
 static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max_x, const tui_snapshot_t *snap) {
+    int fixed_w = 7 + 1 + 6 + 1 + 14 + 1 + 8 + 1 + 15 + 1; /* 55 cols */
+    int path_w = max_x - fixed_w - 6;
+    if (path_w < 15) path_w = 15;
+
     attron(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
-    mvprintw(start_y, 2, "%-7s %-6s %-14s %-8s %-14s %-36s",
-             "PID", "UID", "COMM", "ACCESS", "INTEGRITY", "FILE PATH");
+    mvprintw(start_y, 2, "%-7s %-6s %-14s %-8s %-15s %-*s",
+             "PID", "UID", "COMM", "ACCESS", "INTEGRITY", path_w, "FILE PATH");
     attroff(COLOR_PAIR(PAIR_HEADER) | A_BOLD);
     mvhline(start_y + 1, 2, ACS_HLINE, max_x - 4);
 
@@ -594,6 +633,7 @@ static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max
     if (current_sel >= offset + rows) offset = current_sel - rows + 1;
     tui->scroll_offset[TAB_FILES] = offset;
 
+    char path_buf[256];
     for (int i = 0; i < rows && (offset + i) < snap->num_files; i++) {
         int idx = offset + i;
         const struct sentinel_event *e = &snap->files[idx];
@@ -605,8 +645,7 @@ static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max
             mvhline(y, 1, ' ', max_x - 2);
         }
 
-        char path_buf[48];
-        snprintf(path_buf, sizeof(path_buf), "%s", e->file_path);
+        truncate_str(path_buf, sizeof(path_buf), e->file_path, path_w);
 
         mvprintw(y, 2, "%-7u %-6u %-14s %-8s ",
                  e->pid,
@@ -628,7 +667,7 @@ static void draw_files_tab(tui_dashboard_t *tui, int start_y, int max_y, int max
             printw("%s", e->is_sensitive_file ? "[PROTECTED]  " : "[STANDARD]   ");
         }
 
-        printw("%-36s", path_buf);
+        printw("%-*s", path_w, path_buf);
 
         if (is_selected) {
             attroff(COLOR_PAIR(PAIR_SELECTED_ROW) | A_BOLD);
@@ -834,6 +873,8 @@ static void* tui_render_loop(void *arg) {
         }
 
         if (ch == KEY_RESIZE) {
+            resizeterm(0, 0);
+            clearok(stdscr, TRUE);
             continue;
         }
 
