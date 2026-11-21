@@ -1,8 +1,11 @@
 #include "coresentinel/tui.h"
 #include <arpa/inet.h>
 #include <curses.h>
+#include <dirent.h>
+#include <errno.h>
 #include <locale.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,8 +80,19 @@ struct tui_dashboard {
     int selected_row[NUM_TABS];
     int scroll_offset[NUM_TABS];
     bool is_paused;
+    /* Modal & Dialog States */
     bool show_modal;
     struct sentinel_event modal_event;
+
+    bool show_proc_forensics;
+    char proc_forensics_buf[2048];
+
+    bool show_kill_prompt;
+    uint32_t kill_target_pid;
+    char kill_target_comm[32];
+
+    char status_banner[128];
+    time_t status_banner_expires;
 
     /* Live Search / Filter state */
     bool search_mode;
@@ -445,6 +459,136 @@ static void truncate_str(char *dest, size_t dest_len, const char *src, int max_w
             dest[prefix_len + 3] = '\0';
         }
     }
+}
+
+static bool event_matches_filter(const struct sentinel_event *e, const char *query);
+
+static void set_status_banner(tui_dashboard_t *tui, const char *msg) {
+    if (!tui || !msg) return;
+    snprintf(tui->status_banner, sizeof(tui->status_banner), "%s", msg);
+    tui->status_banner_expires = time(NULL) + 4;
+}
+
+static void load_proc_forensics(uint32_t pid, char *buf, size_t buflen) {
+    if (!buf || buflen == 0) return;
+    buf[0] = '\0';
+
+    char path[128];
+    char cmdline[256] = "N/A";
+    char cwd[256] = "N/A";
+    char exe[256] = "N/A";
+    char status_line[128] = "N/A";
+
+    /* Read /proc/<pid>/cmdline */
+    snprintf(path, sizeof(path), "/proc/%u/cmdline", pid);
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+        fclose(fp);
+        if (n > 0) {
+            for (size_t i = 0; i < n - 1; i++) {
+                if (cmdline[i] == '\0') cmdline[i] = ' ';
+            }
+            cmdline[n] = '\0';
+        }
+    }
+
+    /* Read symlinks exe and cwd */
+    snprintf(path, sizeof(path), "/proc/%u/exe", pid);
+    ssize_t r = readlink(path, exe, sizeof(exe) - 1);
+    if (r > 0) exe[r] = '\0';
+
+    snprintf(path, sizeof(path), "/proc/%u/cwd", pid);
+    r = readlink(path, cwd, sizeof(cwd) - 1);
+    if (r > 0) cwd[r] = '\0';
+
+    /* Read state from /proc/<pid>/status */
+    snprintf(path, sizeof(path), "/proc/%u/status", pid);
+    fp = fopen(path, "r");
+    if (fp) {
+        char line[128];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "State:", 6) == 0) {
+                line[strcspn(line, "\r\n")] = '\0';
+                snprintf(status_line, sizeof(status_line), "%s", line + 7);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    /* Count open file descriptors */
+    int fd_count = 0;
+    snprintf(path, sizeof(path), "/proc/%u/fd", pid);
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] != '.') fd_count++;
+        }
+        closedir(d);
+    }
+
+    snprintf(buf, buflen,
+             "State       : %s\n"
+             "Binary Exec : %s\n"
+             "Working Dir : %s\n"
+             "Full Cmdline: %s\n"
+             "Open FDs    : %d file descriptor(s)\n",
+             status_line, exe, cwd, cmdline, fd_count);
+}
+
+static void export_snapshot_to_json(tui_dashboard_t *tui, const tui_snapshot_t *snap) {
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+
+    char filename[64];
+    strftime(filename, sizeof(filename), "coresentinel-export-%Y%m%d-%H%M%S.json", &tm_info);
+
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        char err_msg[64];
+        snprintf(err_msg, sizeof(err_msg), "Export failed: %s", strerror(errno));
+        set_status_banner(tui, err_msg);
+        return;
+    }
+
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"exported_at\": %ld,\n", (long)now);
+    fprintf(fp, "  \"filter\": \"%s\",\n", tui->search_query);
+    fprintf(fp, "  \"total_events\": %llu,\n", (unsigned long long)snap->total_events);
+    fprintf(fp, "  \"total_alerts\": %llu,\n", (unsigned long long)snap->total_alerts);
+
+    fprintf(fp, "  \"alerts\": [\n");
+    int alert_written = 0;
+    for (int i = 0; i < snap->num_alerts; i++) {
+        const struct sentinel_event *e = &snap->alerts[i];
+        if (!event_matches_filter(e, tui->search_query)) continue;
+        if (alert_written > 0) fprintf(fp, ",\n");
+        fprintf(fp, "    {\"pid\": %u, \"uid\": %u, \"comm\": \"%s\", \"sev\": \"%s\", \"msg\": \"%s\"}",
+                e->pid, e->uid, e->comm, sentinel_severity_str(e->severity), e->alert_msg);
+        alert_written++;
+    }
+    fprintf(fp, "\n  ],\n");
+
+    fprintf(fp, "  \"executions\": [\n");
+    int exec_written = 0;
+    for (int i = 0; i < snap->num_execs; i++) {
+        const struct sentinel_event *e = &snap->execs[i];
+        if (!event_matches_filter(e, tui->search_query)) continue;
+        if (exec_written > 0) fprintf(fp, ",\n");
+        fprintf(fp, "    {\"pid\": %u, \"uid\": %u, \"comm\": \"%s\", \"path\": \"%s\", \"suspicious\": %d}",
+                e->pid, e->uid, e->comm, e->filename, e->is_suspicious_path);
+        exec_written++;
+    }
+    fprintf(fp, "\n  ]\n");
+    fprintf(fp, "}\n");
+    fclose(fp);
+
+    char success_msg[96];
+    snprintf(success_msg, sizeof(success_msg), "Exported snapshot to %s", filename);
+    set_status_banner(tui, success_msg);
 }
 
 static bool event_matches_filter(const struct sentinel_event *e, const char *query) {
@@ -870,13 +1014,101 @@ static void draw_modal_dialog(tui_dashboard_t *tui, int max_y, int max_x) {
 
     // Modal Footer
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
-    mvprintw(my + mh - 2, mx + 3, "Press [Enter], [Esc], or [q] to close this inspection view");
+    mvprintw(my + mh - 2, mx + 3, "Press [p] /proc forensics  |  [k] Terminate PID  |  [Enter/q] Close");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
     attroff(COLOR_PAIR(PAIR_MODAL_BOX));
 }
 
+static void draw_proc_forensics_dialog(tui_dashboard_t *tui, int max_y, int max_x) {
+    if (!tui->show_proc_forensics) return;
+
+    int mw = 76;
+    int mh = 16;
+    if (mw > max_x - 4) mw = max_x - 4;
+    if (mh > max_y - 2) mh = max_y - 2;
+
+    int my = (max_y - mh) / 2;
+    int mx = (max_x - mw) / 2;
+
+    attron(COLOR_PAIR(PAIR_MODAL_BOX));
+    for (int y = my; y < my + mh; y++) {
+        mvhline(y, mx, ' ', mw);
+    }
+    mvhline(my, mx, ACS_HLINE, mw);
+    mvhline(my + mh - 1, mx, ACS_HLINE, mw);
+    mvvline(my, mx, ACS_VLINE, mh);
+    mvvline(my, mx + mw - 1, ACS_VLINE, mh);
+    mvaddch(my, mx, ACS_ULCORNER);
+    mvaddch(my, mx + mw - 1, ACS_URCORNER);
+    mvaddch(my + mh - 1, mx, ACS_LLCORNER);
+    mvaddch(my + mh - 1, mx + mw - 1, ACS_LRCORNER);
+    attroff(COLOR_PAIR(PAIR_MODAL_BOX));
+
+    attron(COLOR_PAIR(PAIR_MODAL_TITLE) | A_BOLD);
+    mvprintw(my, mx + 3, " [ /PROC LIVE FORENSIC INSPECTION ] ");
+    attroff(COLOR_PAIR(PAIR_MODAL_TITLE) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_MODAL_BOX));
+    int cur_y = my + 2;
+    mvprintw(cur_y++, mx + 3, "Target Process : PID %u (Comm: %s)", tui->modal_event.pid, tui->modal_event.comm);
+
+    /* Render lines from proc_forensics_buf */
+    char *copy = strdup(tui->proc_forensics_buf);
+    if (copy) {
+        char *line = strtok(copy, "\n");
+        while (line && cur_y < my + mh - 3) {
+            mvprintw(cur_y++, mx + 3, "%s", line);
+            line = strtok(NULL, "\n");
+        }
+        free(copy);
+    }
+
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    mvprintw(my + mh - 2, mx + 3, "Press [Esc], [Enter], or [q] to return");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+    attroff(COLOR_PAIR(PAIR_MODAL_BOX));
+}
+
+static void draw_kill_prompt_dialog(tui_dashboard_t *tui, int max_y, int max_x) {
+    if (!tui->show_kill_prompt) return;
+
+    int mw = 60;
+    int mh = 8;
+    int my = (max_y - mh) / 2;
+    int mx = (max_x - mw) / 2;
+
+    attron(COLOR_PAIR(PAIR_STATUS_CRIT));
+    for (int y = my; y < my + mh; y++) {
+        mvhline(y, mx, ' ', mw);
+    }
+    mvhline(my, mx, ACS_HLINE, mw);
+    mvhline(my + mh - 1, mx, ACS_HLINE, mw);
+    mvvline(my, mx, ACS_VLINE, mh);
+    mvvline(my, mx + mw - 1, ACS_VLINE, mh);
+    mvaddch(my, mx, ACS_ULCORNER);
+    mvaddch(my, mx + mw - 1, ACS_URCORNER);
+    mvaddch(my + mh - 1, mx, ACS_LLCORNER);
+    mvaddch(my + mh - 1, mx + mw - 1, ACS_LRCORNER);
+
+    mvprintw(my, mx + 3, " [ KILL PROCESS CONFIRMATION ] ");
+    mvprintw(my + 2, mx + 4, "Are you sure you want to terminate process?");
+    mvprintw(my + 3, mx + 4, "PID: %u | COMM: %s", tui->kill_target_pid, tui->kill_target_comm);
+    mvprintw(my + 5, mx + 4, "Press [y] to kill (SIGKILL)  |  [n/Esc] to cancel");
+    attroff(COLOR_PAIR(PAIR_STATUS_CRIT));
+}
+
 static void draw_footer(tui_dashboard_t *tui, int max_y, int max_x) {
     mvhline(max_y - 2, 0, ACS_HLINE, max_x);
+
+    /* Show temporary status banner if active */
+    time_t now = time(NULL);
+    if (tui->status_banner[0] && now < tui->status_banner_expires) {
+        move(max_y - 1, 1);
+        attron(COLOR_PAIR(PAIR_STATUS_WARN) | A_BOLD);
+        printw(" %s ", tui->status_banner);
+        attroff(COLOR_PAIR(PAIR_STATUS_WARN) | A_BOLD);
+        return;
+    }
 
     if (tui->search_mode) {
         move(max_y - 1, 1);
@@ -927,6 +1159,24 @@ static void draw_footer(tui_dashboard_t *tui, int max_y, int max_x) {
     printw("[Enter]");
     attron(COLOR_PAIR(PAIR_DIM_GRAY));
     printw(" Inspect ");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+
+    attron(COLOR_PAIR(PAIR_DEFAULT));
+    printw("[p]");
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    printw(" /proc ");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+
+    attron(COLOR_PAIR(PAIR_DEFAULT));
+    printw("[x]");
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    printw(" Kill ");
+    attroff(COLOR_PAIR(PAIR_DIM_GRAY));
+
+    attron(COLOR_PAIR(PAIR_DEFAULT));
+    printw("[e]");
+    attron(COLOR_PAIR(PAIR_DIM_GRAY));
+    printw(" Export ");
     attroff(COLOR_PAIR(PAIR_DIM_GRAY));
 
     attron(COLOR_PAIR(PAIR_DEFAULT));
@@ -1047,6 +1297,14 @@ static void* tui_render_loop(void *arg) {
             draw_modal_dialog(tui, max_y, max_x);
         }
 
+        if (tui->show_proc_forensics) {
+            draw_proc_forensics_dialog(tui, max_y, max_x);
+        }
+
+        if (tui->show_kill_prompt) {
+            draw_kill_prompt_dialog(tui, max_y, max_x);
+        }
+
         wnoutrefresh(stdscr);
         doupdate();
 
@@ -1061,7 +1319,45 @@ static void* tui_render_loop(void *arg) {
             continue;
         }
 
+        if (tui->show_kill_prompt) {
+            if (ch == 'y' || ch == 'Y') {
+                if (kill((pid_t)tui->kill_target_pid, SIGKILL) == 0) {
+                    char banner[96];
+                    snprintf(banner, sizeof(banner), "✔ Terminated PID %u (%s) via SIGKILL",
+                             tui->kill_target_pid, tui->kill_target_comm);
+                    set_status_banner(tui, banner);
+                } else {
+                    char banner[96];
+                    snprintf(banner, sizeof(banner), "✖ Failed to kill PID %u: %s",
+                             tui->kill_target_pid, strerror(errno));
+                    set_status_banner(tui, banner);
+                }
+                tui->show_kill_prompt = false;
+            } else if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q' || ch == 'Q') {
+                tui->show_kill_prompt = false;
+            }
+            continue;
+        }
+
+        if (tui->show_proc_forensics) {
+            if (ch == '\n' || ch == '\r' || ch == 27 || ch == 'q' || ch == 'Q' || ch == 'x' || ch == 'X') {
+                tui->show_proc_forensics = false;
+            }
+            continue;
+        }
+
         if (tui->show_modal) {
+            if (ch == 'p' || ch == 'P') {
+                load_proc_forensics(tui->modal_event.pid, tui->proc_forensics_buf, sizeof(tui->proc_forensics_buf));
+                tui->show_proc_forensics = true;
+                continue;
+            }
+            if (ch == 'k' || ch == 'K') {
+                tui->kill_target_pid = tui->modal_event.pid;
+                snprintf(tui->kill_target_comm, sizeof(tui->kill_target_comm), "%s", tui->modal_event.comm);
+                tui->show_kill_prompt = true;
+                continue;
+            }
             if (ch == '\n' || ch == '\r' || ch == 27 || ch == 'q' || ch == 'Q' || ch == 'x' || ch == 'X') {
                 tui->show_modal = false;
             }
@@ -1104,6 +1400,57 @@ static void* tui_render_loop(void *arg) {
                 tui->selected_row[tui->active_tab] = 0;
                 tui->scroll_offset[tui->active_tab] = 0;
                 break;
+
+            case 'e':
+            case 'E':
+                export_snapshot_to_json(tui, &snap);
+                break;
+
+            case 'p':
+            case 'P': {
+                /* Open /proc forensics directly for highlighted row */
+                int tab = tui->active_tab;
+                int row = tui->selected_row[tab];
+                const struct sentinel_event *ev = NULL;
+                if (tab == TAB_EXECS && snap.num_execs > 0) {
+                    if (row < snap.num_execs) ev = &snap.execs[row];
+                } else if (tab == TAB_SOCKETS && snap.num_conns > 0) {
+                    if (row < snap.num_conns) ev = &snap.conns[row];
+                } else if (tab == TAB_ALERTS && snap.num_alerts > 0) {
+                    if (row < snap.num_alerts) ev = &snap.alerts[row];
+                } else if (tab == TAB_FILES && snap.num_files > 0) {
+                    if (row < snap.num_files) ev = &snap.files[row];
+                }
+                if (ev && ev->pid > 0) {
+                    tui->modal_event = *ev;
+                    load_proc_forensics(ev->pid, tui->proc_forensics_buf, sizeof(tui->proc_forensics_buf));
+                    tui->show_proc_forensics = true;
+                }
+                break;
+            }
+
+            case 'x':
+            case 'X': {
+                /* Open kill prompt directly for highlighted row (x to terminate) */
+                int tab = tui->active_tab;
+                int row = tui->selected_row[tab];
+                const struct sentinel_event *ev = NULL;
+                if (tab == TAB_EXECS && snap.num_execs > 0) {
+                    if (row < snap.num_execs) ev = &snap.execs[row];
+                } else if (tab == TAB_SOCKETS && snap.num_conns > 0) {
+                    if (row < snap.num_conns) ev = &snap.conns[row];
+                } else if (tab == TAB_ALERTS && snap.num_alerts > 0) {
+                    if (row < snap.num_alerts) ev = &snap.alerts[row];
+                } else if (tab == TAB_FILES && snap.num_files > 0) {
+                    if (row < snap.num_files) ev = &snap.files[row];
+                }
+                if (ev && ev->pid > 0) {
+                    tui->kill_target_pid = ev->pid;
+                    snprintf(tui->kill_target_comm, sizeof(tui->kill_target_comm), "%s", ev->comm);
+                    tui->show_kill_prompt = true;
+                }
+                break;
+            }
 
             case 'q':
             case 'Q':
