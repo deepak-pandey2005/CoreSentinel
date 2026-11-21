@@ -12,6 +12,7 @@ enum event_type {
     EVENT_ACCEPT    = 3,
     EVENT_FILE_OPEN = 4,
     EVENT_PRIV_ESC  = 5,
+    EVENT_PTRACE    = 6,
 };
 
 enum sentinel_severity {

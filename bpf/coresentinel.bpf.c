@@ -86,11 +86,14 @@ int trace_sys_enter_execve(struct trace_event_raw_sys_enter *ctx) {
     /* Safety rule: Potential reverse shell spawn from web servers or script runtimes */
     if ((has_prefix(e->pcomm, "nginx", 5) || has_prefix(e->pcomm, "apache", 6) ||
          has_prefix(e->pcomm, "httpd", 5) || has_prefix(e->pcomm, "node", 4) ||
-         has_prefix(e->pcomm, "python", 6) || has_prefix(e->pcomm, "nc", 2)) &&
+         has_prefix(e->pcomm, "python", 6) || has_prefix(e->pcomm, "ruby", 4) ||
+         has_prefix(e->pcomm, "perl", 4) || has_prefix(e->pcomm, "php", 3) ||
+         has_prefix(e->pcomm, "nc", 2) || has_prefix(e->pcomm, "ncat", 4) ||
+         has_prefix(e->pcomm, "netcat", 6) || has_prefix(e->pcomm, "socat", 5)) &&
         (has_prefix(e->comm, "sh", 2) || has_prefix(e->comm, "bash", 4) ||
          has_prefix(e->comm, "dash", 4) || has_prefix(e->comm, "zsh", 3))) {
         e->severity = SENTINEL_SEV_CRITICAL;
-        __builtin_memcpy(e->alert_msg, "Potential reverse shell: interactive shell spawned by network/script daemon", 76);
+        __builtin_memcpy(e->alert_msg, "CRITICAL: Reverse shell detected: interactive shell spawned by daemon/script runtime", 84);
     }
 
     bpf_ringbuf_submit(e, 0);
@@ -228,6 +231,47 @@ int trace_sys_enter_connect(struct trace_event_raw_sys_enter *ctx) {
     if (e->dport == 4444 || e->dport == 1337 || e->dport == 31337 || e->dport == 6667) {
         e->severity = SENTINEL_SEV_HIGH;
         __builtin_memcpy(e->alert_msg, "Outbound connection to known C2 / hacker backdoor port", 55);
+    }
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* 5. Process Injection & Debugging Monitoring (ptrace) */
+SEC("tracepoint/syscalls/sys_enter_ptrace")
+int trace_sys_enter_ptrace(struct trace_event_raw_sys_enter *ctx) {
+    long request = (long)ctx->args[0];
+    long target_pid = (long)ctx->args[1];
+
+    /* PTRACE_PEEKTEXT = 1, PTRACE_PEEKDATA = 2, PTRACE_POKETEXT = 4, PTRACE_POKEDATA = 5,
+     * PTRACE_ATTACH = 16, PTRACE_SEIZE = 0x4206 */
+    int is_injection = (request == 4 || request == 5 || request == 16 || request == 0x4206);
+
+    struct sentinel_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    __builtin_memset(e, 0, sizeof(*e));
+    e->timestamp_ns = bpf_ktime_get_ns();
+    e->event_type = EVENT_PTRACE;
+    e->severity = is_injection ? SENTINEL_SEV_CRITICAL : SENTINEL_SEV_HIGH;
+
+    unsigned long long pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = (unsigned int)pid_tgid;
+
+    unsigned long long uid_gid = bpf_get_current_uid_gid();
+    e->uid = (unsigned int)uid_gid;
+    e->gid = uid_gid >> 32;
+
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    /* Target PID stored in ppid field for reporting */
+    e->ppid = (unsigned int)target_pid;
+
+    if (is_injection) {
+        __builtin_memcpy(e->alert_msg, "CRITICAL: Potential process injection / thread tampering via ptrace (POKETEXT/ATTACH)", 85);
+    } else {
+        __builtin_memcpy(e->alert_msg, "Process debugging / inspection activity via ptrace", 50);
     }
 
     bpf_ringbuf_submit(e, 0);

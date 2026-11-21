@@ -87,6 +87,7 @@ const char* sentinel_event_type_str(unsigned int type) {
         case EVENT_ACCEPT:    return "ACCEPT";
         case EVENT_FILE_OPEN: return "FILE_OPEN";
         case EVENT_PRIV_ESC:  return "PRIV_ESC";
+        case EVENT_PTRACE:    return "PTRACE";
         default:              return "OTHER";
     }
 }
